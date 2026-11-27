@@ -1342,16 +1342,105 @@ function getOwesNote(user, name) {
 }
 
 
-async function callGroq(key, messages, maxTok, temperature, top_p, frequency_penalty) {
-  const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-    method: 'POST',
-    headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: 'llama-3.3-70b-versatile', messages, temperature, top_p, frequency_penalty, max_tokens: maxTok })
-  });
-  const d = await res.json();
-  if (res.status === 429) throw new Error('429');
-  if (res.ok && d.choices?.[0]?.message?.content) return d.choices[0].message.content;
+// ─── Groq chat — model chain ────────────────────────────────────────────────
+// llama-3.3-70b-versatile was SHUT DOWN for free/developer tiers on 2026-08-16.
+// Override the chain without touching code:  GROQ_MODELS=openai/gpt-oss-120b,openai/gpt-oss-20b  in .env
+const GROQ_MODELS = (process.env.GROQ_MODELS || 'openai/gpt-oss-120b,openai/gpt-oss-20b,qwen/qwen3.8-27b')
+  .split(',').map(m => m.trim()).filter(Boolean);
+const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
+const groqDeadModels = {}; // model -> timestamp until which we skip it
+console.log('Groq model chain: ' + GROQ_MODELS.join(' -> '));
+
+function groqBody(model, messages, o, minimal) {
+  const b = { model, messages };
+  if (o.temperature !== undefined) b.temperature = o.temperature;
+  if (!minimal) {
+    if (o.top_p !== undefined) b.top_p = o.top_p;
+    if (o.frequency_penalty !== undefined) b.frequency_penalty = o.frequency_penalty;
+    if (o.stop) b.stop = o.stop;
+  }
+  const mt = o.maxTok || 200;
+  // gpt-oss are REASONING models: reasoning tokens count against the output cap, so a small cap
+  // returns an empty reply. Low effort + headroom fixes that; capLen() trims the visible reply after.
+  if (model.startsWith('openai/gpt-oss')) { b.reasoning_effort = 'low'; b.max_completion_tokens = mt + 400; }
+  else if (model.startsWith('qwen/qwen3'))  { b.reasoning_effort = 'none'; b.max_completion_tokens = mt + 40; }
+  else                                       { b.max_completion_tokens = mt; }
+  return b;
+}
+
+function capLen(t, max) {
+  if (t.length <= max) return t;
+  const cut = t.slice(0, max);
+  const i = Math.max(cut.lastIndexOf('. '), cut.lastIndexOf('? '), cut.lastIndexOf('! '));
+  return (i > max * 0.4 ? cut.slice(0, i + 1) : cut).trim();
+}
+
+// Try every model in the chain across every key. Returns reply text or null. Never throws.
+async function groqComplete(messages, o = {}) {
+  for (const model of GROQ_MODELS) {
+    if (groqDeadModels[model] && Date.now() < groqDeadModels[model]) continue;
+    const short = model.split('/').pop();
+    for (let i = 0; i < GROQ_KEYS.length; i++) {
+      const key = GROQ_KEYS[groqIndex];
+      const keyNum = groqIndex;
+      groqIndex = (groqIndex + 1) % GROQ_KEYS.length;
+      const ck = `${key}:${model}`;
+      if (isKeyCooling(ck)) continue;
+      try {
+        const send = (msgs, minimal) => fetch(GROQ_URL, {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify(groqBody(model, msgs, o, minimal))
+        });
+        let res = await send(messages, false);
+        let d = await res.json().catch(() => ({}));
+        if (res.status === 400) {   // some models reject optional params — retry bare once
+          console.log(`Groq ${short} key ${keyNum} 400: ${String(d.error?.message || '').slice(0, 140)} — retrying with minimal params`);
+          res = await send(messages, true); d = await res.json().catch(() => ({}));
+        }
+        if (res.status === 413 && o.compact) {
+          console.log(`Groq ${short} key ${keyNum} 413 too large — compact retry`);
+          res = await send(o.compact, true); d = await res.json().catch(() => ({}));
+        }
+        const text = d.choices?.[0]?.message?.content;
+        if (res.ok && text && text.trim()) {
+          console.log(`✅ Groq ${short} key ${keyNum} responded`);
+          return capLen(text, (o.maxTok || 200) * 5);
+        }
+        if (res.ok) { console.log(`Groq ${short} key ${keyNum} returned empty (finish: ${d.choices?.[0]?.finish_reason})`); continue; }
+        const err = String(d.error?.message || '');
+        if (res.status === 429) {
+          const ra = parseInt((res.headers && res.headers.get && res.headers.get('retry-after')) || '0', 10) || 0;
+          const perDay = /per day|\bTPD\b|\bRPD\b/i.test(err);
+          const ms = perDay ? Math.min(Math.max(ra * 1000, 15 * 60000), 60 * 60000) : Math.min(Math.max(ra * 1000, 5000), 60000);
+          coolKey(ck, ms);
+          console.log(`Groq ${short} key ${keyNum} rate limited (429${perDay ? ', DAILY limit' : ''}) — cooling ${Math.round(ms / 1000)}s`);
+        } else if (res.status === 404 || res.status === 403 && /model/i.test(err) || /decommission|does not exist|not found|no longer supported/i.test(err)) {
+          groqDeadModels[model] = Date.now() + 30 * 60000;
+          console.log(`Groq model ${model} unavailable (${res.status}) — skipping it for 30 min: ${err.slice(0, 120)}`);
+          break; // next model
+        } else if (res.status === 401 || res.status === 403) {
+          for (const m of GROQ_MODELS) coolKey(`${key}:${m}`, 10 * 60000);
+          console.log(`Groq key ${keyNum} rejected (${res.status}): ${err.slice(0, 100)}`);
+        } else {
+          console.log(`Groq ${short} key ${keyNum} failed (${res.status}): ${err.slice(0, 100)}`);
+        }
+      } catch (e) { console.log(`Groq ${short} key ${keyNum} error: ${e.message}`); }
+    }
+  }
   return null;
+}
+
+// Newest-first history under a character budget (Groq free tier caps a single request at ~8K tokens).
+function buildHistoryTurns(history, budget = 9000) {
+  const out = []; let used = 0;
+  for (let i = history.length - 1; i >= 0 && out.length < 40; i--) {
+    const h = history[i];
+    const c = h.content.length > 600 ? h.content.slice(0, 600) + '...' : h.content;
+    if (used + c.length > budget && out.length >= 4) break;
+    used += c.length; out.unshift({ role: h.role, content: c });
+  }
+  return out;
 }
 
 client.on('messageCreate', async (msg) => {
@@ -1763,17 +1852,9 @@ client.on('messageCreate', async (msg) => {
   user.summaryTick = (user.summaryTick || 0) + 1;
   if (user.history.length >= 10 && user.summaryTick % 20 === 0) {
     try {
-      const summaryRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${GROQ_KEYS[groqIndex % GROQ_KEYS.length]}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'llama-3.3-70b-versatile',
-          messages: [{ role: 'user', content: `Summarize what Fed learned about ${resolveId(id, displayName)} in 2 sentences.\n\n${user.history.map(h => h.content).join('\n')}` }],
-          max_tokens: 100, temperature: 0.3
-        })
-      });
-      const sd = await summaryRes.json();
-      const summary = sd.choices?.[0]?.message?.content;
+      const summary = await groqComplete(
+        [{ role: 'user', content: `Based on these conversations, write 2 sentences about ${resolveId(id, displayName)}'s SPECIFIC personality — actual quirks, patterns, what they care about, how they talk. Be specific to this person only, no filler.\n\n${user.history.map(h => h.content).join('\n').slice(-6000)}` }],
+        { maxTok: 100, temperature: 0.3 });
       if (summary) {
         user.bio = (user.bio ? user.bio + ' | ' : '') + `[Memory: ${summary.trim()}]`;
         if (user.bio.length > 500) user.bio = user.bio.slice(-400);
@@ -1858,7 +1939,11 @@ client.on('messageCreate', async (msg) => {
     // Inject full shared history (all 60 entries) + full identity roster
     const sharedCtx = getSharedContext();
     const systemPrompt = buildPrompt(id, user, historyTranscript, isMainPerson, isCreator, roastActive, inputLen, mentionContext, sharedCtx, prankWarning, null, milestone, null, '', heatNote, antiRepeatNote, langNote, '');
-    const messages     = [{ role: 'system', content: systemPrompt }, ...user.history.slice(-40).map(h => ({ role: h.role, content: h.content.length > 600 ? h.content.slice(0, 600) + '...' : h.content }))];
+    const messages     = [{ role: 'system', content: systemPrompt }, ...buildHistoryTurns(user.history)];
+    const compactMsgs  = [
+      { role: 'system', content: `You are Fed (Federico Vitale). Lowercase, nonchalant, no emojis, no exclamation marks, charming and real, never an AI. Talking to ${resolveId(id, displayName)}.` },
+      ...messages.slice(-7).filter(m => m.role !== 'system').map(m => ({ role: m.role, content: m.content.slice(0, 300) }))
+    ];;
     // Higher temperature + top_p diversity + frequency penalty prevents same reply to same input
     const temperature  = roastActive ? 1.25 : isMainPerson ? 1.15 : 1.10;
     const top_p        = 0.92;
@@ -1886,45 +1971,7 @@ client.on('messageCreate', async (msg) => {
     }
 
     if (!imageBase64 && GROQ_KEYS.length > 0) {
-      for (let i = 0; i < GROQ_KEYS.length; i++) {
-        const key = GROQ_KEYS[groqIndex];
-        const keyNum = groqIndex;
-        groqIndex = (groqIndex + 1) % GROQ_KEYS.length;
-        if (isKeyCooling(key)) { console.log(`Groq key ${keyNum} cooling, skipping`); continue; }
-        try {
-          const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-            method: 'POST',
-            headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ model: 'llama-3.3-70b-versatile', messages, temperature, top_p, frequency_penalty, max_tokens: maxTok, stop: ['\n\n', `${resolveId(id, displayName)}:`, 'Fed:', 'Federico:'] })
-          });
-          const d = await res.json();
-          if (res.ok && d.choices?.[0]?.message?.content) {
-            reply = d.choices[0].message.content;
-            console.log(`✅ Groq key ${keyNum} responded`);
-            break;
-          } else if (res.status === 429) {
-            coolKey(key);
-            console.log(`Groq key ${keyNum} rate limited (429)`);
-          } else if (res.status === 413) {
-            console.log(`Groq key ${keyNum} 413 too large — compact retry`);
-            const compact = [
-              { role: 'system', content: `You are Fed (Federico Vitale). Lowercase, nonchalant, no emojis, no exclamation marks, charming and real, never an AI. Talking to ${resolveId(id, displayName)}.` },
-              ...messages.slice(-7).filter(m => m.role !== 'system').map(m => ({ role: m.role, content: m.content.slice(0, 300) }))
-            ];
-            try {
-              const r2 = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-                method: 'POST',
-                headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
-                body: JSON.stringify({ model: 'llama-3.3-70b-versatile', messages: compact, temperature, top_p, max_tokens: maxTok })
-              });
-              const d2 = await r2.json();
-              if (r2.ok && d2.choices?.[0]?.message?.content) { reply = d2.choices[0].message.content; console.log(`✅ Groq key ${keyNum} responded (compact)`); break; }
-            } catch {}
-          } else {
-            console.log(`Groq key ${keyNum} failed (${res.status})`);
-          }
-        } catch (e) { console.log(`Groq key ${keyNum} error: ${e.message}`); }
-      }
+      reply = await groqComplete(messages, { maxTok, temperature, top_p, frequency_penalty, stop: ['\n\n', `${resolveId(id, displayName)}:`, 'Fed:', 'Federico:'], compact: compactMsgs });
     }
 
     // Gemini fallback — tries each model (flash → flash-8b) across all keys with cooldown
@@ -1966,15 +2013,7 @@ client.on('messageCreate', async (msg) => {
       console.log('⏳ All keys busy — waiting 8s then one more pass...');
       await new Promise(r => setTimeout(r, 8000));
       // One more Groq pass
-      for (let i = 0; i < GROQ_KEYS.length && !reply; i++) {
-        const key = GROQ_KEYS[groqIndex];
-        groqIndex = (groqIndex + 1) % GROQ_KEYS.length;
-        if (isKeyCooling(key)) continue;
-        try {
-          reply = await callGroq(key, messages, maxTok, temperature, top_p, frequency_penalty);
-          if (reply) console.log(`✅ Retry Groq key ${groqIndex} responded`);
-        } catch (e) { if (e.message.startsWith('429')) coolKey(key); }
-      }
+      reply = await groqComplete(messages, { maxTok, temperature, top_p, frequency_penalty, compact: compactMsgs });
       // One more Gemini pass
       if (!reply) {
         for (const model of GEMINI_MODELS) {
@@ -2073,28 +2112,10 @@ ${transcript}`;
   let review = null;
 
   // Try Groq first
-  for (let i = 0; i < GROQ_KEYS.length; i++) {
-    const key = GROQ_KEYS[groqIndex];
-    groqIndex = (groqIndex + 1) % GROQ_KEYS.length;
-    if (isKeyCooling(key)) continue;
-    try {
-      const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'llama-3.3-70b-versatile',
-          messages: [{ role: 'user', content: prompt }],
-          max_tokens: 180,
-          temperature: 1.1,
-        })
-      });
-      const d = await res.json();
-      if (res.ok && d.choices?.[0]?.message?.content) {
-        review = d.choices[0].message.content.trim();
-        break;
-      } else if (res.status === 429) { coolKey(key); }
-    } catch (e) { console.log(`Daily rating Groq error: ${e.message}`); }
-  }
+  try {
+    const g = await groqComplete([{ role: 'user', content: prompt }], { maxTok: 180, temperature: 1.1 });
+    if (g) review = g.trim();
+  } catch (e) { console.log(`Daily rating Groq error: ${e.message}`); }
 
   // Gemini fallback
   if (!review) {
